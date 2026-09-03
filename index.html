@@ -1,0 +1,385 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Flipkart Label Crop</title>
+
+    <script
+      src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs"
+      type="module"
+    ></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 600px;
+        margin: 50px auto;
+        padding: 20px;
+      }
+
+      button {
+        padding: 10px 18px;
+        margin-top: 15px;
+        cursor: pointer;
+      }
+
+      #status {
+        margin-top: 15px;
+      }
+    </style>
+  </head>
+
+  <body>
+    <h2>Flipkart Label Crop</h2>
+
+    <input id="file" type="file" accept="application/pdf" />
+
+    <br />
+
+    <button id="crop">Auto Crop</button>
+
+    <div id="status"></div>
+
+    <script type="module">
+      import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs";
+
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
+
+      const { PDFDocument } = PDFLib;
+
+      const fileInput = document.getElementById("file");
+      const button = document.getElementById("crop");
+      const status = document.getElementById("status");
+
+      button.onclick = async () => {
+        const file = fileInput.files[0];
+
+        if (!file) {
+          alert("Select a PDF first");
+          return;
+        }
+
+        status.textContent = "Processing...";
+
+        const buffer = await file.arrayBuffer();
+
+        /*
+      pdf.js transfers (detaches) whatever ArrayBuffer it is given,
+      so hand it its own copy and keep the original bytes for pdf-lib.
+    */
+
+        const pdf = await pdfjsLib.getDocument({
+          data: buffer.slice(0),
+        }).promise;
+
+        const output = await PDFDocument.create();
+
+        /*
+      Load the source document once, not once per page.
+    */
+
+        const sourcePdf = await PDFDocument.load(buffer);
+
+        for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) {
+          status.textContent = `Processing page ${pageNo} of ${pdf.numPages}...`;
+
+          const page = await pdf.getPage(pageNo);
+
+          const viewport = page.getViewport({
+            scale: 2,
+          });
+
+          const canvas = document.createElement("canvas");
+
+          canvas.width = Math.ceil(viewport.width);
+          canvas.height = Math.ceil(viewport.height);
+
+          const ctx = canvas.getContext("2d", {
+            willReadFrequently: true,
+          });
+
+          await page.render({
+            canvasContext: ctx,
+            viewport,
+          }).promise;
+
+          const crop = detectFlipkartLabel(canvas);
+
+          if (!crop) {
+            console.warn(`Could not detect label on page ${pageNo}`);
+            continue;
+          }
+
+          /*
+      Convert rendered-pixel coordinates
+      back to original PDF coordinates.
+    */
+
+          const originalViewport = page.getViewport({ scale: 1 });
+
+          const scale = viewport.width / originalViewport.width;
+
+          const x = crop.x / scale;
+
+          const yTop = crop.y / scale;
+
+          const width = crop.width / scale;
+
+          const height = crop.height / scale;
+
+          /*
+      PDF coordinates start from bottom-left.
+    */
+
+          const y = originalViewport.height - yTop - height;
+
+          /*
+      Every output page is a fixed 353 x 480 pt label.
+      Fit the detected crop inside that box while keeping
+      its aspect ratio, and centre it (letterbox the
+      leftover space instead of stretching).
+    */
+
+          const targetW = 353;
+          const targetH = 480;
+
+          const fit = Math.min(targetW / width, targetH / height);
+
+          const offX = (targetW - width * fit) / 2;
+          const offY = (targetH - height * fit) / 2;
+
+          const newPage = output.addPage([targetW, targetH]);
+
+          /*
+      Instead of rasterizing the final output,
+      embed the original PDF page and crop it.
+    */
+
+          const [embeddedPage] = await output.embedPages([
+            sourcePdf.getPages()[pageNo - 1],
+          ]);
+
+          newPage.drawPage(embeddedPage, {
+            x: offX - x * fit,
+            y: offY - y * fit,
+            width: originalViewport.width * fit,
+            height: originalViewport.height * fit,
+          });
+        }
+
+        const result = await output.save();
+
+        const blob = new Blob([result], {
+          type: "application/pdf",
+        });
+
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+
+        a.href = url;
+        a.download = "flipkart-labels-cropped.pdf";
+
+        a.click();
+
+        URL.revokeObjectURL(url);
+
+        status.textContent = "Done";
+      };
+
+      /*
+====================================================
+FLIPKART LABEL DETECTION
+
+A Flipkart shipping label is always the top block
+of the page, enclosed in a solid rectangular border.
+Everything below that border (the tax invoice) must
+be dropped. So instead of guessing at inner content
+we locate that outer border and crop to it:
+
+  1. find the label's solid TOP border line
+  2. from its ends, follow the LEFT and RIGHT
+     vertical borders downward
+  3. snap the bottom to the solid horizontal line
+     that closes the box
+
+Solid lines are detected with a near-zero gap
+tolerance so the dashed invoice separator below the
+box is never mistaken for a border.
+====================================================
+*/
+
+      function detectFlipkartLabel(canvas) {
+        const width = canvas.width;
+        const height = canvas.height;
+
+        const data = canvas
+          .getContext("2d")
+          .getImageData(0, 0, width, height).data;
+
+        const isDark = (x, y) => {
+          const i = (y * width + x) * 4;
+          return (data[i] + data[i + 1] + data[i + 2]) / 3 < 170;
+        };
+
+        /*
+    Longest horizontal run of dark pixels on a row,
+    tolerating gaps up to `gapTol` px (antialiasing).
+  */
+        const longestRun = (y, gapTol) => {
+          let bestLen = 0;
+          let bestStart = 0;
+          let bestEnd = 0;
+          let start = -1;
+          let lastDark = -1;
+
+          for (let x = 0; x < width; x++) {
+            if (isDark(x, y)) {
+              if (start === -1) start = x;
+              lastDark = x;
+            } else if (start !== -1 && x - lastDark > gapTol) {
+              if (lastDark - start > bestLen) {
+                bestLen = lastDark - start;
+                bestStart = start;
+                bestEnd = lastDark;
+              }
+              start = -1;
+            }
+          }
+
+          if (start !== -1 && lastDark - start > bestLen) {
+            bestLen = lastDark - start;
+            bestStart = start;
+            bestEnd = lastDark;
+          }
+
+          return { len: bestLen, start: bestStart, end: bestEnd };
+        };
+
+        /* Solid-line gap tolerance (dashed lines exceed this). */
+        const solidGap = Math.max(2, Math.round(width * 0.003));
+
+        /*
+    1. Top border: first wide solid horizontal line
+       in the upper half of the page.
+  */
+        let top = -1;
+        let left = 0;
+        let right = width - 1;
+
+        for (let y = Math.round(height * 0.01); y < height * 0.5; y++) {
+          const run = longestRun(y, solidGap);
+          if (run.len > width * 0.35) {
+            top = y;
+            left = run.start;
+            right = run.end;
+            break;
+          }
+        }
+
+        if (top === -1) return null;
+
+        /* Refine corners from the few rows around the top border. */
+        for (let y = top; y < top + 6 && y < height; y++) {
+          const run = longestRun(y, solidGap);
+          if (run.len > right - left) {
+            left = run.start;
+            right = run.end;
+          }
+        }
+
+        /*
+    2. Follow a vertical border downward from the top,
+       allowing small gaps where text meets the line.
+  */
+        const vGap = Math.round(height * 0.02);
+
+        const followDown = (edgeX) => {
+          let lastDark = top;
+          let missing = 0;
+
+          for (let y = top + 1; y < height; y++) {
+            let dark = false;
+            for (let dx = -4; dx <= 4; dx++) {
+              const xx = edgeX + dx;
+              if (xx >= 0 && xx < width && isDark(xx, y)) {
+                dark = true;
+                break;
+              }
+            }
+
+            if (dark) {
+              lastDark = y;
+              missing = 0;
+            } else if (++missing > vGap) {
+              break;
+            }
+          }
+
+          return lastDark;
+        };
+
+        let bottom = Math.min(followDown(left), followDown(right));
+
+        /*
+    3. Snap the bottom to the solid horizontal line
+       that actually closes the box (search only a
+       little past where the vertical border gave out
+       so we never reach the dashed invoice cut-line).
+  */
+        const searchEnd = Math.min(
+          height - 1,
+          bottom + Math.round(height * 0.03),
+        );
+
+        for (let y = searchEnd; y > top + height * 0.1; y--) {
+          const run = longestRun(y, solidGap);
+          if (run.len > (right - left) * 0.8) {
+            bottom = Math.max(bottom, y);
+            break;
+          }
+        }
+
+        /*
+    Trim any dashed / dotted line that sits just above
+    the solid border: walk up past rows that only carry
+    a sparse broken line (short solid runs but dark when
+    gaps are ignored).
+  */
+        for (let y = bottom - 1; y > bottom - Math.round(height * 0.04); y--) {
+          const solid = longestRun(y, solidGap).len;
+          const loose = longestRun(y, Math.round(width * 0.05)).len;
+          if (loose > (right - left) * 0.6 && solid < (right - left) * 0.2) {
+            bottom = y - 1;
+          }
+        }
+
+        const w = right - left;
+        const h = bottom - top;
+
+        if (w < width * 0.2 || h < height * 0.15) return null;
+
+        /*
+    Pad the top / left / right so the border line stays
+    inside the crop, but never pad the bottom — that is
+    what keeps the dashed cut-line out.
+  */
+        const margin = 2;
+
+        const x = Math.max(0, left - margin);
+        const y = Math.max(0, top - margin);
+        const x2 = Math.min(width, right + margin);
+
+        return {
+          x,
+          y,
+          width: x2 - x,
+          height: bottom - y,
+        };
+      }
+    </script>
+  </body>
+</html>
