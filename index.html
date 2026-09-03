@@ -180,8 +180,14 @@
 
         const a = document.createElement("a");
 
+        const stamp = new Date()
+          .toISOString()
+          .replace(/[:.]/g, "-")
+          .replace("T", "_")
+          .slice(0, 19);
+
         a.href = url;
-        a.download = "flipkart-labels-cropped.pdf";
+        a.download = `flipkart-labels-cropped-${stamp}.pdf`;
 
         a.click();
 
